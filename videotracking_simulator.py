@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import cv2
 import PID
+import LowPassFilter
 
 
 def Rx(theta):
@@ -54,9 +55,10 @@ for t in range(0,steps):
     theta += omega * dt
 
 ### Target Trajectory ###
+v_t = 10
 target_position = np.zeros((steps,3))
 target_position[:,2] = height
-v_t = 0
+target_position[:,0] = 0 + np.arange(0, steps) * v_t
 
 
 # Gimbal parameters (roll pitch and yaw)
@@ -68,23 +70,32 @@ gimbal_roll = np.deg2rad(gimbal_roll_deg)
 gimbal_pitch = np.deg2rad(gimbal_pitch_deg)  # Initial pitch angle in radians
 gimbal_yaw = np.deg2rad(gimbal_yaw_deg)  # Initial yaw angle in radians
 gimbal_pitch_rate = 0.0  # Pitch rotation speed
-gimbal_yaw_rate = np.deg2rad(9.0)  # Yaw rotation speed
+gimbal_yaw_rate = np.deg2rad(0.0)  # Yaw rotation speed
 
 
 # PID controller parameters
-Kp = 5.0  # Proportional gain
-Ki = 1.0 # Integral gain
-Kd = 1.0  # Derivative gain
+Kp = 1.0  # Proportional gain
+Ki = 0.1 # Integral gain
+Kd = 0.0  # Derivative gain
 
-pidh = PID.PID(Kp, Ki, Kd, output_limits=(-30, 30), integral_limits=(-15, 15), derivative_limits=(-15, 15))
-pidv = PID.PID(Kp, Ki, Kd, output_limits=(-30, 30), integral_limits=(-10, 10), derivative_limits=(-15, 15))
+pidh = PID.PID(Kp, Ki, Kd, output_limits=(-30, 30), integral_limits=(-10, 10), derivative_limits=(-10, 10))
+pidv = PID.PID(Kp, Ki, Kd, output_limits=(-15, 15), integral_limits=(-5, 5), derivative_limits=(-10, 10))
+
+# PID controller parameters
+Kp = 1.0  # Proportional gain
+Ki = 0.0 # Integral gain
+Kd = 0.0  # Derivative gain
+
+pidh2 = PID.PID(Kp, Ki, Kd, output_limits=(-30, 30), integral_limits=(-15, 15), derivative_limits=(-10, 10))
+pidv2 = PID.PID(Kp, Ki, Kd, output_limits=(-30, 30), integral_limits=(-10, 10), derivative_limits=(-10, 10))
 
 # Camera parameters
 pixel_pitch = 2.8e-6  # Pixel pitch in meters (2.8 microns)
 sensor_size_pixels = np.array([1920, 1080])  # Sensor size in pixels (width, height)
 sensor_size_meters = sensor_size_pixels * pixel_pitch  # Sensor size in meters
+
 # Focal length in meters
-focal_length = 129e-3  # 129 mm in meters
+focal_length = 80e-3  # 129 mm in meters
 
 # Calculate FOV (Field of View)
 fov_horizontal = (2 * np.arctan2(sensor_size_meters[0] / 2, focal_length))  # Horizontal FOV in radians
@@ -123,13 +134,30 @@ image.fill(255)
 prev_x_pixel = 0
 prev_y_pixel = 0
 i = 0
-ff_yaw = np.deg2rad(9.5) # can be used to initialize feedforward term
+ff_yaw = np.deg2rad(9.54) # can be used to initialize feedforward term
 ff_pitch = np.deg2rad(0) # can be used to initialize feedforward term
 yaw_out = 0
 pitch_out = 0
 error_yaw_speed = 0
 error_pitch_speed = 0
 
+# Initialize arrays to store past yaw and pitch rates for moving average
+yaw_rates_history = []
+pitch_rates_history = []
+
+ff_yaw_rates_history = []
+ff_pitch_rates_history = []
+
+ff_yaw_lowpass = LowPassFilter.LowPassFilter(2.5, dt)
+ff_yaw_lowpass.initialize(ff_yaw)
+ff_pitch_lowpass = LowPassFilter.LowPassFilter(1, dt)
+
+def moving_average(data, window_size=10):
+    """Apply a simple moving average filter."""
+    if len(data) < window_size:
+        return np.mean(data)  # If not enough data, average what we have
+    else:
+        return np.mean(data[-window_size:])  # Average the last `window_size` data points
 
 def project_to_camera_opencv(drone_pos, target_pos, pitch, yaw):
     R_roll = Rx(0.0)
@@ -175,18 +203,26 @@ def update_gimbal_pid(x_pixel, y_pixel):
        print("Target out of the image. Lost tracking.")
        exit(0)
 
-    yaw_out = np.deg2rad(pidh.calculate(np.rad2deg(error_yaw), dt))
-    pitch_out = np.deg2rad(pidv.calculate(np.rad2deg(error_pitch), dt))
+    _yaw_out = np.deg2rad(pidh.calculate(np.rad2deg(error_yaw), dt))
+    _pitch_out = np.deg2rad(pidv.calculate(np.rad2deg(error_pitch), dt))
 
-    gimbal_yaw_rate = ff_yaw + yaw_out
-    gimbal_pitch_rate = ff_pitch + pitch_out
+    yaw_out = np.deg2rad(pidh2.calculate(np.rad2deg(_yaw_out), dt))
+    pitch_out = np.deg2rad(pidv2.calculate(np.rad2deg(_pitch_out), dt))
+
+    # Append the latest outputs to the history
+    yaw_rates_history.append(yaw_out)
+    pitch_rates_history.append(pitch_out)
+
+    # Apply moving average filter to the history to smooth and delay the response
+    gimbal_yaw_rate = moving_average(yaw_rates_history, window_size=3) + ff_yaw
+    gimbal_pitch_rate = moving_average(pitch_rates_history, window_size=3) + ff_pitch
     
     # Update gimbal angles
     gimbal_yaw += gimbal_yaw_rate * dt
     gimbal_pitch += gimbal_pitch_rate * dt
 
-    ff_yaw = gimbal_yaw_rate
-    ff_pitch = gimbal_pitch_rate
+    #ff_yaw = gimbal_yaw_rate
+    #ff_pitch = gimbal_pitch_rate
 
 def update_image(x_pixel, y_pixel):
     # Update tracking box position
@@ -217,15 +253,42 @@ def update_image(x_pixel, y_pixel):
     cv2.imshow("Camera View", image_)
     cv2.waitKey(1000)
 
+def target_motion_estimator(x_pixel, y_pixel):
+    global ff_yaw, ff_pitch
+    if( (prev_x_pixel == 0) or (prev_y_pixel == 0) ):
+        return
+
+    target_h_speed = (m.atan2( ((x_pixel - sensor_size_pixels[0]) * pixel_pitch), focal_length ) - m.atan2( ((prev_x_pixel - sensor_size_pixels[0]) * pixel_pitch), focal_length ) ) / dt
+    target_v_speed = (-m.atan2( -((y_pixel - sensor_size_pixels[1]) * pixel_pitch ), focal_length ) + m.atan2( -((prev_y_pixel - sensor_size_pixels[1]) * pixel_pitch ), focal_length ) ) / dt
+    
+    target_h_speed_nocomp = target_h_speed + gimbal_yaw_rate
+    target_v_speed_nocomp = target_v_speed + gimbal_pitch_rate
+
+    print(f"Target Horizontal Speed w/t compensation: {np.rad2deg(target_h_speed + gimbal_yaw_rate)}")
+    print(f"Target Vertical Speed w/t compensation: {np.rad2deg(target_v_speed + gimbal_pitch_rate)}")
+
+    print(f"Target Horizontal Speed: {np.rad2deg(target_h_speed)}")
+    print(f"Target Vertical Speed: {np.rad2deg(target_v_speed)}")
+
+    # Append the latest outputs to the history
+    ff_yaw_rates_history.append(target_h_speed_nocomp)
+    ff_pitch_rates_history.append(target_v_speed_nocomp)
+
+    ff_yaw = ff_yaw_lowpass.filter(target_h_speed_nocomp)
+#    ff_yaw = moving_average(ff_yaw_rates_history, window_size=5)
+    #ff_pitch = moving_average(ff_pitch_rates_history, window_size=3)
 
 def update(frame):
     global drone_position, target_position, i
+    global prev_x_pixel, prev_y_pixel
 
     # Project target onto the 2D camera plane
     x_pixel, y_pixel = project_to_camera_opencv(drone_position, target_position, gimbal_pitch, gimbal_yaw)
 
     # Update gimbal angles using PID
     update_gimbal_pid(x_pixel, sensor_size_pixels[1] - y_pixel)
+
+    target_motion_estimator(x_pixel, sensor_size_pixels[1] - y_pixel)
 
     # Update Camera View image
     update_image(x_pixel, y_pixel)
@@ -234,6 +297,9 @@ def update(frame):
     ned_map_drone.set_data_3d(drone_position[i,0],drone_position[i,1], drone_position[i,2])
     ned_map_target.set_data_3d(target_position[i,0],target_position[i,1], target_position[i,2])
     i += 1
+
+    prev_x_pixel = x_pixel
+    prev_y_pixel = y_pixel
     return ned_map_drone, ned_map_target,
 
 # Create animation
